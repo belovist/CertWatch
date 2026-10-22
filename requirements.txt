@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+cryptography
+requests
+rich
+typer
