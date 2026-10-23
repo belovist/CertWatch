@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="CertWatch", version="2.0.0")
-CONNECT_TIMEOUT_SECONDS = 3.0
+CONNECT_TIMEOUT_SECONDS = 2.5
 MAX_DOMAINS_PER_REQUEST = 50
 DOMAIN_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 DEPRECATED_TLS = {"TLSv1", "TLSv1.1"}
@@ -82,6 +82,8 @@ async def resolve_address(domain: str) -> tuple[str, int, int]:
 
 async def fetch_hsts(domain: str) -> bool:
     context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
     reader, writer = await asyncio.wait_for(asyncio.open_connection(domain, 443, ssl=context, server_hostname=domain), timeout=CONNECT_TIMEOUT_SECONDS)
     try:
         writer.write((f"HEAD / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: CertWatch/2.0\r\nConnection: close\r\n\r\n").encode("ascii"))
@@ -92,7 +94,7 @@ async def fetch_hsts(domain: str) -> bool:
         writer.close()
         try:
             await writer.wait_closed()
-        except (ConnectionError, ssl.SSLError):
+        except Exception:
             pass
 
 
@@ -135,16 +137,16 @@ async def inspect_domain_async(raw_domain: str) -> dict[str, Any]:
     connection_start = perf_counter()
     try:
         start = perf_counter()
-        address, port, family = await asyncio.wait_for(resolve_address(domain), timeout=2.5)
+        address, port, family = await asyncio.wait_for(resolve_address(domain), timeout=CONNECT_TIMEOUT_SECONDS)
         result["latency"]["dns_ms"] = milliseconds(start)
         start = perf_counter()
-        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port, family=family), timeout=2.5)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port, family=family), timeout=CONNECT_TIMEOUT_SECONDS)
         result["latency"]["tcp_ms"] = milliseconds(start)
         start = perf_counter()
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        await asyncio.wait_for(writer.start_tls(context, server_hostname=domain, ssl_handshake_timeout=2.5), timeout=2.5)
+        await asyncio.wait_for(writer.start_tls(context, server_hostname=domain, ssl_handshake_timeout=CONNECT_TIMEOUT_SECONDS), timeout=CONNECT_TIMEOUT_SECONDS)
         result["latency"]["tls_ms"] = milliseconds(start)
         result["latency"]["total_ms"] = milliseconds(connection_start)
         ssl_object: ssl.SSLObject | None = writer.get_extra_info("ssl_object")
@@ -190,7 +192,7 @@ async def inspect_domain_async(raw_domain: str) -> dict[str, Any]:
             writer.close()
             try:
                 await writer.wait_closed()
-            except (ConnectionError, ssl.SSLError):
+            except Exception:
                 pass
 
     try:
@@ -202,9 +204,15 @@ async def inspect_domain_async(raw_domain: str) -> dict[str, Any]:
         if not result["error"]:
             add_issue(result, "Could not verify HSTS header", "Ensure HTTPS responds to HEAD requests and sets Strict-Transport-Security.")
 
-    result["security_grade"] = grade_result(result, public_key)
-    critical = bool(result["error"]) or (result["days_remaining"] is not None and result["days_remaining"] < 7) or result["security_grade"] == "F"
-    result["status"] = "Critical" if critical else "Warning" if result["issues"] else "OK"
+    try:
+        result["security_grade"] = grade_result(result, public_key)
+        critical = bool(result["error"]) or (result["days_remaining"] is not None and result["days_remaining"] < 7) or result["security_grade"] == "F"
+        result["status"] = "Critical" if critical else "Warning" if result["issues"] else "OK"
+    except Exception as exc:
+        result["status"] = "Critical"
+        result["security_grade"] = "F"
+        result["error"] = f"Inspection error: {str(exc)}"
+        add_issue(result, "Could not calculate security grade", "Review the endpoint certificate and TLS configuration.")
     return result
 
 
@@ -217,4 +225,14 @@ async def health() -> dict[str, str]:
 async def scan(request: ScanRequest) -> list[dict[str, Any]]:
     if len(request.domains) > MAX_DOMAINS_PER_REQUEST:
         raise HTTPException(status_code=422, detail=f"Maximum {MAX_DOMAINS_PER_REQUEST} domains per scan")
-    return list(await asyncio.gather(*(inspect_domain_async(domain) for domain in request.domains)))
+    results = await asyncio.gather(*(inspect_domain_async(domain) for domain in request.domains), return_exceptions=True)
+    inspected: list[dict[str, Any]] = []
+    for domain, result in zip(request.domains, results):
+        if isinstance(result, Exception):
+            failure = base_result(str(domain).strip() or "(empty)")
+            failure["error"] = f"Inspection error: {str(result)}"
+            add_issue(failure, "HTTPS/TLS inspection failed", "Verify DNS, port 443, and the TLS server configuration.")
+            inspected.append(failure)
+        else:
+            inspected.append(result)
+    return inspected
