@@ -135,13 +135,16 @@ async def inspect_domain_async(raw_domain: str) -> dict[str, Any]:
     connection_start = perf_counter()
     try:
         start = perf_counter()
-        address, port, family = await asyncio.wait_for(resolve_address(domain), timeout=CONNECT_TIMEOUT_SECONDS)
+        address, port, family = await asyncio.wait_for(resolve_address(domain), timeout=2.5)
         result["latency"]["dns_ms"] = milliseconds(start)
         start = perf_counter()
-        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port, family=family), timeout=CONNECT_TIMEOUT_SECONDS)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port, family=family), timeout=2.5)
         result["latency"]["tcp_ms"] = milliseconds(start)
         start = perf_counter()
-        await asyncio.wait_for(writer.start_tls(ssl.create_default_context(), server_hostname=domain, ssl_handshake_timeout=CONNECT_TIMEOUT_SECONDS), timeout=CONNECT_TIMEOUT_SECONDS)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        await asyncio.wait_for(writer.start_tls(context, server_hostname=domain, ssl_handshake_timeout=2.5), timeout=2.5)
         result["latency"]["tls_ms"] = milliseconds(start)
         result["latency"]["total_ms"] = milliseconds(connection_start)
         ssl_object: ssl.SSLObject | None = writer.get_extra_info("ssl_object")
@@ -171,14 +174,15 @@ async def inspect_domain_async(raw_domain: str) -> dict[str, Any]:
         if signature in WEAK_SIGNATURES:
             add_issue(result, f"Weak certificate signature: {signature}", "Reissue the certificate using SHA-256 or a stronger signature algorithm.")
     except asyncio.TimeoutError:
-        result["error"] = "DNS, TCP, or TLS connection timed out after 3 seconds"
+        result["error"] = "DNS, TCP, or TLS connection timed out after 2.5 seconds"
         add_issue(result, "TLS connection timeout", "Check DNS, firewall rules, and port 443 reachability.")
     except ssl.SSLCertVerificationError as exc:
         result["error"] = f"Certificate chain is not trusted: {exc.verify_message}"
         add_issue(result, "Certificate chain is invalid or untrusted", "Deploy a certificate with its complete trusted intermediate chain.")
     except Exception as exc:
-        result["error"] = f"TLS inspection failed: {exc}"
-        add_issue(result, "HTTPS/TLS service is unavailable", "Verify DNS, port 443, and the TLS server configuration.")
+        result["status"] = "Critical"
+        result["error"] = f"Inspection error: {str(exc)}"
+        add_issue(result, "HTTPS/TLS inspection failed", "Verify DNS, port 443, and the TLS server configuration.")
     finally:
         if result["latency"]["total_ms"] is None:
             result["latency"]["total_ms"] = milliseconds(connection_start)
